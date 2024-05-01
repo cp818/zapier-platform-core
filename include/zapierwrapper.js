@@ -2,4 +2,5 @@
 const path = require('path');
 const zapier = require('zapier-platform-core');
 const appPath = path.resolve(__dirname, 'index.js');
-module.exports = {handler: zapier.createAppHandler(appPath)};
+// don't `require(appPath)` out here
+module.exports = { handler: zapier.createAppHandler(appPath) };

@@ -1,10 +1,22 @@
 'use strict';
 
 const _ = require('lodash');
+const { defaults, pick, pipe } = require('lodash/fp');
 
-const isPlainObj = require('./data').isPlainObj;
-const recurseReplace = require('./data').recurseReplace;
-const flattenPaths = require('./data').flattenPaths;
+const {
+  flattenPaths,
+  getObjectType,
+  isPlainObj,
+  recurseReplace
+} = require('./data');
+
+const DEFAULT_BUNDLE = {
+  authData: {},
+  inputData: {},
+  meta: {},
+  subscribeData: {},
+  targetUrl: ''
+};
 
 const recurseCleanFuncs = (obj, path) => {
   // mainly turn functions into $func${arity}${arguments}$
@@ -30,51 +42,119 @@ const recurseCleanFuncs = (obj, path) => {
 };
 
 // Recurse a nested object replace all instances of keys->vals in the bank.
-const recurseReplaceBank = (obj, bank) => {
-  bank = bank || {};
+const recurseReplaceBank = (obj, bank = {}) => {
   const replacer = out => {
-    if (typeof out !== 'string') {
+    if (!['string', 'number'].includes(typeof out)) {
       return out;
     }
+
+    // whatever leaves this function replaces values in the calling object
+    // so, we don't want to return a different data type unless it's a censored string
+    const originalValue = out;
+    const originalValueStr = String(out);
+    let maybeChangedString = originalValueStr;
+
     Object.keys(bank).forEach(key => {
-      const s = String(key).replace(/[-[\]/{}()\\*+?.^$|]/g, '\\$&');
-      const re = new RegExp(s, 'g');
-      out = out.replace(re, bank[key]);
+      // Escape characters (ex. {{foo}} => \\{\\{foo\\}\\} )
+      const escapedKey = key.replace(/[-[\]/{}()\\*+?.^$|]/g, '\\$&');
+      const matchesKey = new RegExp(escapedKey, 'g');
+
+      if (!matchesKey.test(maybeChangedString)) {
+        return;
+      }
+
+      const matchesCurlies = /({{.*?}})/;
+      const valueParts = maybeChangedString
+        .split(matchesCurlies)
+        .filter(Boolean);
+      const replacementValue = bank[key];
+      const isPartOfString =
+        !matchesCurlies.test(maybeChangedString) || valueParts.length > 1;
+      const shouldThrowTypeError =
+        isPartOfString &&
+        (Array.isArray(replacementValue) || _.isPlainObject(replacementValue));
+
+      if (shouldThrowTypeError) {
+        throw new TypeError(
+          `Cannot reliably interpolate objects or arrays into a string. We received an ${getObjectType(
+            replacementValue
+          )}:\n"${replacementValue}"`
+        );
+      }
+
+      maybeChangedString = isPartOfString
+        ? valueParts.join('').replace(matchesKey, replacementValue)
+        : replacementValue;
     });
-    return out;
+
+    if (originalValueStr === maybeChangedString) {
+      // we didn't censor or replace the value, so return the original
+      return originalValue;
+    }
+    return maybeChangedString;
   };
   return recurseReplace(obj, replacer);
 };
 
-// Takes a raw app and bundle and composes a bank of {{key}}->val
-const createBundleBank = (appRaw, event) => {
-  appRaw = appRaw || {};
-  event = event || {};
+const finalizeBundle = pipe(
+  pick(Object.keys(DEFAULT_BUNDLE)),
+  defaults(DEFAULT_BUNDLE)
+);
 
-  const bundle = event.bundle || {};
+// Takes a raw app and bundle and composes a bank of {{key}}->val
+const createBundleBank = (appRaw, event = {}) => {
   const bank = {
-    bundle: _.merge(
-      {},
-      { authData: bundle.authData || {} },
-      { inputData: bundle.inputData || {} }
-    ),
+    bundle: finalizeBundle(event.bundle),
     process: {
       env: _.extend({}, process.env || {})
     }
   };
 
-  const flattenedBank = flattenPaths(bank);
+  const options = { preserve: { 'bundle.inputData': true } };
+  const flattenedBank = flattenPaths(bank, options);
   return Object.keys(flattenedBank).reduce((coll, key) => {
     coll[`{{${key}}}`] = flattenedBank[key];
     return coll;
   }, {});
 };
 
-const maskOutput = output => _.pick(output, 'results');
+const maskOutput = output => _.pick(output, 'results', 'status');
+
+const normalizeEmptyRequestFields = (shouldCleanup, field, req) => {
+  const handleEmpty = req.removeMissingValuesFrom[field]
+    ? key => delete req[field][key]
+    : key => (req[field][key] = '');
+
+  Object.entries(req[field]).forEach(([key, value]) => {
+    if (shouldCleanup(value)) {
+      handleEmpty(key);
+    }
+  });
+};
+
+const isCurlies = /{{.*?}}/;
+const isEmptyQueryParam = value =>
+  value === '' ||
+  value === null ||
+  value === undefined ||
+  isCurlies.test(value);
+
+const normalizeEmptyParamFields = normalizeEmptyRequestFields.bind(
+  null,
+  isEmptyQueryParam,
+  'params'
+);
+const normalizeEmptyBodyFields = normalizeEmptyRequestFields.bind(
+  null,
+  v => isCurlies.test(v),
+  'body'
+);
 
 module.exports = {
-  recurseCleanFuncs,
-  recurseReplaceBank,
   createBundleBank,
-  maskOutput
+  maskOutput,
+  normalizeEmptyBodyFields,
+  normalizeEmptyParamFields,
+  recurseCleanFuncs,
+  recurseReplaceBank
 };
